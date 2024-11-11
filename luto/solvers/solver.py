@@ -556,41 +556,7 @@ class LutoSolver:
             raise ValueError(
                 'DEMAND_CONSTRAINT_TYPE not specified in settings, needs to be "hard" or "soft"'
             )
-
-    def _get_water_nyield_base_year_vars_current_year_layers(
-        self, region: int, region_ind: np.ndarray
-    ) -> float:
-        """
-        Calculates the water net yield using the base year's (previous year's) variable
-        solutions and this year's water net yield matrices.
-
-        This helps the edge case where, over time, irreversible non-ag land uses make
-        water constraints infeasible.
-        """
-        if any(
-            [
-                self._input_data.base_year_ag_sol is None,
-                self._input_data.base_year_non_ag_sol is None,
-                self._input_data.base_year_ag_man_sol is None,
-            ]
-        ):
-            raise ValueError(
-                "Base year solutions must be provided to calculate water "
-                "net yield of the base year with current year layers."
-            )
-
-        return calc_water_net_yield_for_region(
-            region_ind,
-            self._input_data.am2j,
-            self._input_data.base_year_ag_sol,
-            self._input_data.base_year_non_ag_sol,
-            self._input_data.base_year_ag_man_sol,
-            self._input_data.ag_w_mrj,
-            self._input_data.non_ag_w_rk,
-            self._input_data.ag_man_w_mrj,
-            self._input_data.water_yield_outside_study_area[self._input_data.target_year][region],
-        )
-
+        
     def _add_water_usage_limit_constraints(self):
         """
         Adds constraints to handle water usage limits.
@@ -600,10 +566,8 @@ class LutoSolver:
 
         print(f'  ...water net yield constraints by {settings.WATER_REGION_DEF}...')
 
-        min_var = lambda var, prev_var: var if prev_var.x > 1e-3 else prev_var.x
-
         # Ensure water use remains below limit for each region
-        for region, (reg_name, _, w_hist_yield_limit, ind) in self._input_data.limits["water"].items():
+        for region, (reg_name, _, base_w_net_yield_limit, ind) in self._input_data.limits["water"].items():
 
             ag_contr = gp.quicksum(
                 gp.quicksum(
@@ -636,22 +600,19 @@ class LutoSolver:
             )
 
             outside_luto_study_contr = self._input_data.water_yield_outside_study_area[self._input_data.target_year][region]
+            cc_impact_yield_delta = self._input_data.water_yield_natural_land_cc_impact_delta.loc[self._input_data.target_year, region]
 
             # Sum of all water yield contributions
             w_net_yield_region = ag_contr + ag_man_contr + non_ag_contr + outside_luto_study_contr
-            
-            
-            # Update the net yield limit to be lower based on last year's solution if at risk of infeasibility
-            base_year_water_yield_with_current_layers = None
-            
-            cc_impact_yield_delta = self._input_data.water_yield_natural_land_cc_impact_delta.loc[self._input_data.target_year, region]
-            constr_wny_limit = w_hist_yield_limit + cc_impact_yield_delta
-            
+            overall_wyield_limit = base_w_net_yield_limit + cc_impact_yield_delta
+
+            constr_wny_limit = overall_wyield_limit
             wny_limit_updated = False
-            if self._input_data.base_year_ag_sol is not None and settings.RELAXED_WATER_LIMITS_FOR_INFEASIBILITY == 'on':
-                base_year_water_yield_with_current_layers = self._get_water_nyield_base_year_vars_current_year_layers(region, ind)
-                if base_year_water_yield_with_current_layers < constr_wny_limit:
-                    constr_wny_limit = base_year_water_yield_with_current_layers
+            if settings.RELAXED_WATER_LIMITS_FOR_INFEASIBILITY == 'on':
+                # if 2010 water net yield is below the current water limit, replace with 2010 water net yield
+                sim_base_year_yield = self._input_data.sim_base_year_net_wyield[region]
+                if sim_base_year_yield < overall_wyield_limit:
+                    constr_wny_limit = sim_base_year_yield
                     wny_limit_updated = True
 
             # Check that the contributions are not all zero, and add constraint if so.
@@ -661,11 +622,11 @@ class LutoSolver:
                 self.water_limit_constraints.append(constr)
 
             if settings.VERBOSE == 1:
-                print(f"    ...net water yield in {reg_name} >= {w_hist_yield_limit:.2f} ML")
+                print(f"    ...net water yield in {reg_name} >= {constr_wny_limit:.2f} ML")
                 if wny_limit_updated:
                     print(
-                        f"        ...net water yield in {reg_name} lowered from {w_hist_yield_limit:.2f} ML "
-                        f"to {constr_wny_limit:.2f} ML to avoid infeasibility"
+                        f"        ...limit in {reg_name} ({overall_wyield_limit:.2f} ML) exceeds 2010 net "
+                        f"water yield ({constr_wny_limit:.2f} ML) and was lowered to avoid infeasibility."
                     )
 
     def _get_total_ghg_emissions_expr(self) -> gp.LinExpr:
